@@ -1,9 +1,10 @@
 using Google.Cloud.Functions.Framework;
+using Google.Cloud.Functions.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.IO;
-using System.Net;
 using System;
 
 using Heroes.ReplayParser;
@@ -11,153 +12,138 @@ using Google.Cloud.Storage.V1;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Diagnostics;
 
 namespace HeroesProfile_GCP_ReplayParser
 {
+    [FunctionsStartup(typeof(Startup))]
     public class Function : IHttpFunction
     {
- 
-        /// <summary>
-        /// Logic for your function goes here.
-        /// </summary>
-        /// <param name="context">The HTTP context, containing the request and the response.</param>
-        /// <returns>A task representing the asynchronous operation.</returns>
+        private readonly ILogger<Function> _logger;
+        private readonly StorageClient _storageClient;
+
+        public Function(ILogger<Function> logger, StorageClient storageClient)
+        {
+            _logger = logger;
+            _storageClient = storageClient;
+        }
+
         public async Task HandleAsync(HttpContext context)
         {
-            InputData data = new InputData();
+            var totalStopwatch = Stopwatch.StartNew();
 
-            using (StreamReader reader = new StreamReader(context.Request.Body, Encoding.UTF8))
+            InputData data;
+            using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
             {
-                string requestBody = await reader.ReadToEndAsync();
+                var requestBody = await reader.ReadToEndAsync();
                 data = InputData.FromJson(requestBody);
             }
 
-            var client = StorageClient.Create();
+            _logger.LogInformation("Processing replay: bucket={Bucket}, input={Input}, parseType={ParseType}",
+                data.Bucket, data.Input, data.ParseType);
 
-
+            var downloadStopwatch = Stopwatch.StartNew();
             byte[] bytes;
-
             using (var stream = new MemoryStream())
             {
-                await client.DownloadObjectAsync(data.Bucket, data.Input, stream);
-
-                using (var dst = new MemoryStream())
-                {
-                    bytes = stream.GetBuffer();
-                }
+                await _storageClient.DownloadObjectAsync(data.Bucket, data.Input, stream);
+                bytes = stream.ToArray();
             }
+            downloadStopwatch.Stop();
 
-            ParseOptions parseOptions = new ParseOptions
-            {
-                ShouldParseUnits = false,
-                ShouldParseMouseEvents = false,
-                ShouldParseDetailedBattleLobby = true,
-                ShouldParseEvents = true,
-                ShouldParseMessageEvents = true
-            };
+            _logger.LogInformation("Downloaded replay: size={SizeBytes} bytes, elapsed={DownloadMs}ms",
+                bytes.Length, downloadStopwatch.ElapsedMilliseconds);
 
+            var parseOptions = GetParseOptions(data.ParseType);
 
-            switch (data.ParseType)
-            {
-                case "fingerprintOnly":
-                    parseOptions = new ParseOptions
-                    {
-                        ShouldParseUnits = false,
-                        ShouldParseMouseEvents = false,
-                        ShouldParseDetailedBattleLobby = true,
-                        ShouldParseEvents = false,
-                        ShouldParseMessageEvents = false
-                    };
-                    break;
-
-                case "fallback1":
-                    parseOptions = ParseOptions.MediumParsing;
-                    break;
-
-                case "fallback2":
-                    parseOptions = ParseOptions.DefaultParsing;
-                    break;
-
-                case "fallback3":
-                    parseOptions = ParseOptions.MinimalParsing;
-                    break;
-
-                case "full":
-                    parseOptions = ParseOptions.FullParsing;
-                    break;
-
-                default:
-                    parseOptions = new ParseOptions
-                    {
-                        ShouldParseUnits = false,
-                        ShouldParseMouseEvents = false,
-                        ShouldParseDetailedBattleLobby = true,
-                        ShouldParseEvents = true,
-                        ShouldParseMessageEvents = true
-                    };
-                    break;
-            }
-    
-
+            var parseStopwatch = Stopwatch.StartNew();
             var result = DataParser.ParseReplay(bytes, parseOptions);
+            parseStopwatch.Stop();
 
-
+            _logger.LogInformation("Parsed replay: result={ParseResult}, elapsed={ParseMs}ms",
+                result.Item1, parseStopwatch.ElapsedMilliseconds);
 
             if (result.Item1 != DataParser.ReplayParseResult.Success || result.Item2 == null)
             {
+                _logger.LogWarning("Replay parse failed: result={ParseResult}, input={Input}",
+                    result.Item1, data.Input);
+
                 await context.Response.WriteAsync($"Error parsing replay: {result.Item1}");
             }
             else
             {
-                string calculated_fingerprint = GetFingerprint(result.Item2);
+                string calculatedFingerprint = GetFingerprint(result.Item2);
 
                 if (data.ParseType != "fingerprintOnly")
                 {
-                    bool match = true;
+                    bool match = calculatedFingerprint == data.Fingerprint;
 
-                    if (calculated_fingerprint != data.Fingerprint)
-                    {
-                        match = false;
-                    }
-
-                    Dictionary<Player, int> cameraDistance = new Dictionary<Player, int>();
+                    var cameraDistance = new Dictionary<Player, int>();
                     if (data.ParseType == "default")
                     {
-                        cameraDistance = determineCameraDistancePerPlayer(result.Item2);
+                        cameraDistance = DetermineCameraDistancePerPlayer(result.Item2);
                     }
-                    int upload_team;
 
+                    int uploadTeam;
                     try
                     {
-                        upload_team = calculateUploadTeam(result.Item2);
+                        uploadTeam = CalculateUploadTeam(result.Item2);
                     }
                     catch
                     {
-                        upload_team = -1;
+                        uploadTeam = -1;
                     }
-                    var return_data = ToJson(result.Item2, match, calculated_fingerprint, upload_team, cameraDistance);
 
-                    await context.Response.WriteAsync(Newtonsoft.Json.JsonConvert.SerializeObject(return_data));
+                    var returnData = ToJson(result.Item2, match, calculatedFingerprint, uploadTeam, cameraDistance);
+                    await context.Response.WriteAsync(Newtonsoft.Json.JsonConvert.SerializeObject(returnData));
                 }
                 else
                 {
                     var obj = new
                     {
-                        fingerprint = calculated_fingerprint,
+                        fingerprint = calculatedFingerprint,
                         game_date = result.Item2.Timestamp
                     };
 
                     await context.Response.WriteAsync(Newtonsoft.Json.JsonConvert.SerializeObject(obj));
                 }
             }
+
+            totalStopwatch.Stop();
+            _logger.LogInformation("Request complete: parseType={ParseType}, totalElapsed={TotalMs}ms",
+                data.ParseType, totalStopwatch.ElapsedMilliseconds);
         }
 
-        public static object ToJson(Replay replay, bool match, string calculated_fingerprint, int upload_team, Dictionary<Player, int> cameraDistance)
+        private static ParseOptions GetParseOptions(string parseType) => parseType switch
+        {
+            "fingerprintOnly" => new ParseOptions
+            {
+                ShouldParseUnits = false,
+                ShouldParseMouseEvents = false,
+                ShouldParseDetailedBattleLobby = true,
+                ShouldParseEvents = false,
+                ShouldParseMessageEvents = false
+            },
+            "fallback1" => ParseOptions.MediumParsing,
+            "fallback2" => ParseOptions.DefaultParsing,
+            "fallback3" => ParseOptions.MinimalParsing,
+            "full" => ParseOptions.FullParsing,
+            _ => new ParseOptions
+            {
+                ShouldParseUnits = false,
+                ShouldParseMouseEvents = false,
+                ShouldParseDetailedBattleLobby = true,
+                ShouldParseEvents = true,
+                ShouldParseMessageEvents = true
+            }
+        };
+
+        public static object ToJson(Replay replay, bool match, string calculatedFingerprint, int uploadTeam, Dictionary<Player, int> cameraDistance)
         {
             var obj = new
             {
                 random_value = replay.RandomValue,
-                calculated_fingerprint = calculated_fingerprint,
+                calculated_fingerprint = calculatedFingerprint,
                 fingerprint_match = match,
                 mode = replay.GameMode.ToString(),
                 region = replay.Players[0].BattleNetRegionId,
@@ -171,7 +157,7 @@ namespace HeroesProfile_GCP_ReplayParser
                 bans = replay.TeamHeroBans,
                 draft_order = replay.DraftOrder,
                 team_experience = replay.TeamPeriodicXPBreakdown,
-                upload_team = upload_team,
+                upload_team = uploadTeam,
                 players = from p in replay.Players
                           select new
                           {
@@ -215,25 +201,19 @@ namespace HeroesProfile_GCP_ReplayParser
             return result.ToString();
         }
 
-
-        private static int calculateUploadTeam(Replay replay)
+        private static int CalculateUploadTeam(Replay replay)
         {
-            int team = -1;
-
             if (replay.Messages.Count > 0)
             {
                 int playerIndex = replay.Messages[0].PlayerIndex;
-
-                var player = replay.Players[playerIndex];
-
-                team = player.Team;
+                return replay.Players[playerIndex].Team;
             }
-            return team;
+            return -1;
         }
 
-        private static Dictionary<Player, int> determineCameraDistancePerPlayer(Replay replay)
+        private static Dictionary<Player, int> DetermineCameraDistancePerPlayer(Replay replay)
         {
-            Dictionary<Player, int> cameraDistance = new Dictionary<Player, int>();
+            var cameraDistance = new Dictionary<Player, int>();
 
             for (int i = 0; i < replay.GameEvents.Count; i++)
             {
@@ -241,18 +221,14 @@ namespace HeroesProfile_GCP_ReplayParser
                 {
                     try
                     {
-
                         if (!cameraDistance.ContainsKey(replay.GameEvents[i].player))
                         {
                             cameraDistance.Add(replay.GameEvents[i].player, Convert.ToInt32(replay.GameEvents[i].data.array[1].unsignedInt));
                         }
-
                     }
                     catch
                     {
-
                     }
-
                 }
             }
             return cameraDistance;
