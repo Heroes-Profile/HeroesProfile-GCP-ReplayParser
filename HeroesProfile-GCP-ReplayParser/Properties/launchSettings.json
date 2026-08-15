@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "HeroesProfile-GCP-ReplayParser": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "$(ProjectDir)local-testing-cred.json"
+      }
+    }
+  }
+}
