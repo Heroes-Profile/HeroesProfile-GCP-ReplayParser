@@ -13,6 +13,10 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using Google;
 
 namespace HeroesProfile_GCP_ReplayParser
 {
@@ -28,7 +32,30 @@ namespace HeroesProfile_GCP_ReplayParser
             _storageClient = storageClient;
         }
 
+        // A replay is under 10MB; a download still going after this is a stalled connection.
+        private static readonly TimeSpan DownloadAttemptTimeout = TimeSpan.FromSeconds(15);
+        private const int DownloadAttempts = 3;
+
         public async Task HandleAsync(HttpContext context)
+        {
+            try
+            {
+                await ProcessAsync(context);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Request failed");
+
+                // Without a body the caller only ever sees an empty 500.
+                if (!context.Response.HasStarted)
+                {
+                    context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                    await context.Response.WriteAsync($"Parser error: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
+        private async Task ProcessAsync(HttpContext context)
         {
             var totalStopwatch = Stopwatch.StartNew();
 
@@ -43,12 +70,7 @@ namespace HeroesProfile_GCP_ReplayParser
                 data.Bucket, data.Input, data.ParseType);
 
             var downloadStopwatch = Stopwatch.StartNew();
-            byte[] bytes;
-            using (var stream = new MemoryStream())
-            {
-                await _storageClient.DownloadObjectAsync(data.Bucket, data.Input, stream);
-                bytes = stream.ToArray();
-            }
+            byte[] bytes = await DownloadAsync(data.Bucket, data.Input);
             downloadStopwatch.Stop();
 
             _logger.LogInformation("Downloaded replay: size={SizeBytes} bytes, elapsed={DownloadMs}ms",
@@ -113,6 +135,35 @@ namespace HeroesProfile_GCP_ReplayParser
             _logger.LogInformation("Request complete: parseType={ParseType}, totalElapsed={TotalMs}ms",
                 data.ParseType, totalStopwatch.ElapsedMilliseconds);
         }
+
+        private async Task<byte[]> DownloadAsync(string bucket, string name)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                using var timeout = new CancellationTokenSource(DownloadAttemptTimeout);
+                using var stream = new MemoryStream();
+
+                try
+                {
+                    await _storageClient.DownloadObjectAsync(bucket, name, stream, cancellationToken: timeout.Token);
+                    return stream.ToArray();
+                }
+                catch (Exception ex) when (attempt < DownloadAttempts && IsTransient(ex))
+                {
+                    _logger.LogWarning(ex, "Download attempt {Attempt} failed for {Input}, retrying", attempt, name);
+                }
+            }
+        }
+
+        // Stalls and reset connections recover on a fresh attempt; a missing object or bad request never will.
+        private static bool IsTransient(Exception ex) => ex switch
+        {
+            GoogleApiException api => api.HttpStatusCode == HttpStatusCode.TooManyRequests || (int)api.HttpStatusCode >= 500,
+            OperationCanceledException => true,
+            HttpRequestException => true,
+            IOException => true,
+            _ => false
+        };
 
         private static ParseOptions GetParseOptions(string parseType) => parseType switch
         {
