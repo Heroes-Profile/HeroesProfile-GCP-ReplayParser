@@ -38,13 +38,22 @@ namespace HeroesProfile_GCP_ReplayParser
 
         public async Task HandleAsync(HttpContext context)
         {
+            InputData data = null;
+
             try
             {
-                await ProcessAsync(context);
+                using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
+                {
+                    var requestBody = await reader.ReadToEndAsync();
+                    data = InputData.FromJson(requestBody);
+                }
+
+                await ProcessAsync(context, data);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Request failed");
+                _logger.LogError(ex, "Request failed: bucket={Bucket}, input={Input}, parseType={ParseType}",
+                    data?.Bucket, data?.Input, data?.ParseType);
 
                 // Without a body the caller only ever sees an empty 500.
                 if (!context.Response.HasStarted)
@@ -55,35 +64,19 @@ namespace HeroesProfile_GCP_ReplayParser
             }
         }
 
-        private async Task ProcessAsync(HttpContext context)
+        private async Task ProcessAsync(HttpContext context, InputData data)
         {
             var totalStopwatch = Stopwatch.StartNew();
-
-            InputData data;
-            using (var reader = new StreamReader(context.Request.Body, Encoding.UTF8))
-            {
-                var requestBody = await reader.ReadToEndAsync();
-                data = InputData.FromJson(requestBody);
-            }
-
-            _logger.LogInformation("Processing replay: bucket={Bucket}, input={Input}, parseType={ParseType}",
-                data.Bucket, data.Input, data.ParseType);
 
             var downloadStopwatch = Stopwatch.StartNew();
             byte[] bytes = await DownloadAsync(data.Bucket, data.Input);
             downloadStopwatch.Stop();
-
-            _logger.LogInformation("Downloaded replay: size={SizeBytes} bytes, elapsed={DownloadMs}ms",
-                bytes.Length, downloadStopwatch.ElapsedMilliseconds);
 
             var parseOptions = GetParseOptions(data.ParseType);
 
             var parseStopwatch = Stopwatch.StartNew();
             var result = DataParser.ParseReplay(bytes, parseOptions);
             parseStopwatch.Stop();
-
-            _logger.LogInformation("Parsed replay: result={ParseResult}, elapsed={ParseMs}ms",
-                result.Item1, parseStopwatch.ElapsedMilliseconds);
 
             if (result.Item1 != DataParser.ReplayParseResult.Success || result.Item2 == null)
             {
@@ -132,8 +125,9 @@ namespace HeroesProfile_GCP_ReplayParser
             }
 
             totalStopwatch.Stop();
-            _logger.LogInformation("Request complete: parseType={ParseType}, totalElapsed={TotalMs}ms",
-                data.ParseType, totalStopwatch.ElapsedMilliseconds);
+            _logger.LogInformation("Parsed replay: input={Input}, parseType={ParseType}, result={ParseResult}, size={SizeBytes} bytes, download={DownloadMs}ms, parse={ParseMs}ms, total={TotalMs}ms",
+                data.Input, data.ParseType, result.Item1, bytes.Length,
+                downloadStopwatch.ElapsedMilliseconds, parseStopwatch.ElapsedMilliseconds, totalStopwatch.ElapsedMilliseconds);
         }
 
         private async Task<byte[]> DownloadAsync(string bucket, string name)
