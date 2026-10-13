@@ -48,16 +48,18 @@ steps:
       - push
       - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
 
+  # deploy rather than services update: only deploy can set --base-image, which has to match
+  # the builder (google-24, .NET 10) or automatic base image updates swap in mismatched layers.
   - id: Deploy
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: gcloud
     args:
       - run
-      - services
-      - update
+      - deploy
       - $_SERVICE_NAME
       - --platform=managed
       - --image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - --base-image=us-east1-docker.pkg.dev/serverless-runtimes/google-24/runtimes/dotnet10
       - --labels=managed-by=gcp-cloud-build-deploy-cloud-run,commit-sha=$COMMIT_SHA,gcb-build-id=$BUILD_ID,gcb-trigger-id=$_TRIGGER_ID
       - --region=$_DEPLOY_REGION
       - --quiet
