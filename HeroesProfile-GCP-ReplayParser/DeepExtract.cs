@@ -14,7 +14,7 @@ namespace HeroesProfile_GCP_ReplayParser
     // changes; cached docs with an older version are rebuilt from the archive.
     public static class DeepExtract
     {
-        public const int Version = 1;
+        public const int Version = 2;
 
         public static readonly string ParserVersion =
             typeof(Replay).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
@@ -121,14 +121,29 @@ namespace HeroesProfile_GCP_ReplayParser
 
                 regen_globes = players.Select((p, i) => new { p = i, t = p.RegenGlobePickups.Select(S).ToArray() }),
 
-                // Estimated by the parser from move orders, one point per second (the last known in that second)
+                // [t, player, x, y]: where each globe was picked up, so where the hero stood
+                globe_points = GlobePoints(replay, players).Select(g => new[] { S(g.t), g.p, g.x, g.y }),
+
+                // [t, player, x, y]: move orders (no ability) and their retargets, the last per second
+                moves = gameEvents
+                    .Select(g => (g, target:
+                        g.eventType == GameEventType.CCmdEvent && g.data?.array?.Length > 2 && g.data.array[1] == null ? TargetPoint(g.data.array[2])
+                        : g.eventType == GameEventType.CCmdUpdateTargetPointEvent ? TargetPoint(g.data)
+                        : null))
+                    .Where(m => m.target != null)
+                    .GroupBy(m => (S(m.g.TimeSpan), index[m.g.player]))
+                    .Select(m => { var last = m.Last(); return new[] { m.Key.Item1, m.Key.Item2, last.target[0], last.target[1] }; })
+                    .OrderBy(m => m[0]),
+
+                // [t, x, y, estimated]: the last point of each kind per second. Real points come from the
+                // game's position events; estimated ones are move and ability target points.
                 hero_positions = players.Select((p, i) => new
                 {
                     p = i,
                     pts = p.HeroUnits.SelectMany(u => u.Positions)
-                        .GroupBy(pos => S(pos.TimeSpan))
-                        .OrderBy(g => g.Key)
-                        .Select(g => { var last = g.Last(); return new[] { g.Key, last.Point.X, last.Point.Y }; })
+                        .GroupBy(pos => (t: S(pos.TimeSpan), e: pos.IsEstimated))
+                        .OrderBy(g => g.Key.t).ThenBy(g => g.Key.e)
+                        .Select(g => { var last = g.Last(); return new[] { g.Key.t, last.Point.X, last.Point.Y, g.Key.e ? 1 : 0 }; })
                         .ToArray()
                 }),
 
@@ -196,6 +211,47 @@ namespace HeroesProfile_GCP_ReplayParser
                         idx = m.PlayerAnnounceMessage.AbilityAnnouncement?.AbilityIndex
                     })
             };
+        }
+
+        // A pickup has no position, but the globe unit dies where it was taken. Several globes can go in
+        // the same second (other lanes, the neutral copy on the same spot); take the one nearest the
+        // player's closest real position in time, or skip the pickup when there is none to go on.
+        private static IEnumerable<(TimeSpan t, int p, int x, int y)> GlobePoints(Replay replay, Player[] players)
+        {
+            var globes = replay.Units
+                .Where(u => (u.Name == "RegenGlobe" || u.Name == "RegenGlobeNeutral") && u.TimeSpanDied.HasValue && u.PointDied != null)
+                .ToList();
+
+            for (var i = 0; i < players.Length; i++)
+            {
+                var player = players[i];
+                var real = player.HeroUnits.SelectMany(u => u.Positions).Where(pos => !pos.IsEstimated && pos.Point != null).ToList();
+
+                foreach (var t in player.RegenGlobePickups)
+                {
+                    var candidates = globes
+                        .Where(u => (u.TimeSpanDied.Value - t).TotalSeconds >= -1.5 && (u.TimeSpanDied.Value - t).TotalSeconds <= 0.5)
+                        .Where(u => u.Team == null || u.Team == player.Team || u.Name == "RegenGlobeNeutral")
+                        .Select(u => u.PointDied)
+                        .ToList();
+                    if (candidates.Count == 0)
+                        continue;
+
+                    Point chosen;
+                    if (candidates.All(c => c.DistanceTo(candidates[0]) <= 3))
+                        chosen = candidates[0];
+                    else
+                    {
+                        var reference = real.Where(pos => Math.Abs((pos.TimeSpan - t).TotalSeconds) <= 20)
+                            .OrderBy(pos => Math.Abs((pos.TimeSpan - t).TotalSeconds)).FirstOrDefault();
+                        if (reference == null)
+                            continue;
+                        chosen = candidates.OrderBy(c => c.DistanceTo(reference.Point)).First();
+                    }
+
+                    yield return (t, i, chosen.X, chosen.Y);
+                }
+            }
         }
 
         // CCmdEvent m_data: a target point is [x, y, z] in 1/4096 map units; a target unit carries its snapshot point at [6]
