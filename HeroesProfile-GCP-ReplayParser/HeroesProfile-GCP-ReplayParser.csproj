@@ -2,13 +2,25 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
+    <!-- Keep in step with the tag lib/Heroes.ReplayParser is checked out at. -->
+    <ReplayParserVersion>1.2.20</ReplayParserVersion>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Google.Cloud.Functions.Hosting" Version="3.0.1" />
     <PackageReference Include="Google.Cloud.Storage.V1" Version="4.14.0" />
-    <PackageReference Include="Heroes.ReplayParser" Version="1.2.18" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <None Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- The Heroes-Profile fork of Heroes.ReplayParser, as a git submodule. GitVersion is
+       switched off because the Cloud Build checkout has no tag history to version from. -->
+  <ItemGroup>
+    <ProjectReference Include="lib/Heroes.ReplayParser/Heroes.ReplayParser/Heroes.ReplayParser.csproj"
+                      AdditionalProperties="DisableGitVersionTask=true;Version=$(ReplayParserVersion)" />
+    <Compile Remove="lib/**" />
+    <None Remove="lib/**" />
+    <Content Remove="lib/**" />
+    <EmbeddedResource Remove="lib/**" />
   </ItemGroup>
 </Project>

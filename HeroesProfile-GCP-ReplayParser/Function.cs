@@ -16,6 +16,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
+using System.IO.Compression;
 using Google;
 
 namespace HeroesProfile_GCP_ReplayParser
@@ -48,7 +49,10 @@ namespace HeroesProfile_GCP_ReplayParser
                     data = InputData.FromJson(requestBody);
                 }
 
-                await ProcessAsync(context, data);
+                if (data.ParseType == "deep")
+                    await DeepAsync(context, data);
+                else
+                    await ProcessAsync(context, data);
             }
             catch (Exception ex)
             {
@@ -130,8 +134,101 @@ namespace HeroesProfile_GCP_ReplayParser
                 downloadStopwatch.ElapsedMilliseconds, parseStopwatch.ElapsedMilliseconds, totalStopwatch.ElapsedMilliseconds);
         }
 
-        private async Task<byte[]> DownloadAsync(string bucket, string name)
+        // Called by Cloud Tasks with one replay. Writes the deep analytics doc to
+        // gs://{DEEP_BUCKET}/doc/{replayID}.json.gz and never touches the default parse path.
+        // A replay that won't parse still gets a doc (with an error) so the caller stops waiting
+        // and Cloud Tasks stops retrying; only infrastructure failures return an error status.
+        private async Task DeepAsync(HttpContext context, InputData data)
         {
+            var totalStopwatch = Stopwatch.StartNew();
+
+            if (!data.ReplayID.HasValue || string.IsNullOrEmpty(data.Bucket) || string.IsNullOrEmpty(data.Input) || data.Offset.HasValue != data.Length.HasValue)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsync("parseType=deep needs replayID, bucket and input (and offset with length for an archive slice)");
+                return;
+            }
+
+            var replayID = data.ReplayID.Value;
+            var docBucket = Environment.GetEnvironmentVariable("DEEP_BUCKET") ?? "heroesprofile-replay-deep";
+            var docName = $"doc/{replayID}.json.gz";
+
+            try
+            {
+                var existing = await _storageClient.GetObjectAsync(docBucket, docName);
+                if (existing.Metadata != null && existing.Metadata.TryGetValue("extract_v", out var version) && version == DeepExtract.Version.ToString())
+                {
+                    await WriteDeepResponse(context, replayID, "cached", (long)(existing.Size ?? 0), totalStopwatch);
+                    return;
+                }
+            }
+            catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.NotFound)
+            {
+            }
+
+            byte[] bytes = await DownloadAsync(data.Bucket, data.Input, data.Offset, data.Length);
+            if (data.Length.HasValue && bytes.Length != data.Length.Value)
+                throw new InvalidOperationException($"Archive slice for replay {replayID} came back {bytes.Length} bytes, expected {data.Length.Value}");
+
+            var parseStopwatch = Stopwatch.StartNew();
+            var result = DataParser.ParseReplay(bytes, DeepExtract.ParseOptions);
+            parseStopwatch.Stop();
+
+            object doc;
+            string status;
+            if (result.Item1 != DataParser.ReplayParseResult.Success || result.Item2 == null)
+            {
+                doc = DeepExtract.Failed(replayID, result.Item1.ToString());
+                status = "unparseable";
+            }
+            else
+            {
+                doc = DeepExtract.Build(result.Item2, replayID, GetFingerprint(result.Item2));
+                status = "written";
+            }
+
+            byte[] compressed;
+            using (var buffer = new MemoryStream())
+            {
+                using (var gzip = new GZipStream(buffer, CompressionLevel.Optimal, leaveOpen: true))
+                    System.Text.Json.JsonSerializer.Serialize(gzip, doc);
+                compressed = buffer.ToArray();
+            }
+
+            await _storageClient.UploadObjectAsync(new Google.Apis.Storage.v1.Data.Object
+            {
+                Bucket = docBucket,
+                Name = docName,
+                ContentType = "application/gzip",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["extract_v"] = DeepExtract.Version.ToString(),
+                    ["parser_version"] = DeepExtract.ParserVersion ?? "",
+                    ["status"] = status
+                }
+            }, new MemoryStream(compressed));
+
+            _logger.LogInformation("Deep extract: replayID={ReplayID}, status={Status}, result={ParseResult}, size={SizeBytes} bytes, doc={DocBytes} bytes, parse={ParseMs}ms, total={TotalMs}ms",
+                replayID, status, result.Item1, bytes.Length, compressed.Length, parseStopwatch.ElapsedMilliseconds, totalStopwatch.ElapsedMilliseconds);
+
+            await WriteDeepResponse(context, replayID, status, compressed.Length, totalStopwatch);
+        }
+
+        private static Task WriteDeepResponse(HttpContext context, long replayID, string status, long docBytes, Stopwatch stopwatch) =>
+            context.Response.WriteAsync(Newtonsoft.Json.JsonConvert.SerializeObject(new { replay_id = replayID, status, doc_bytes = docBytes, ms = stopwatch.ElapsedMilliseconds }));
+
+        // offset/length read one replay out of an archive bundle. The object's stored hash
+        // covers the whole bundle, so a range download can't be hash-checked.
+        private async Task<byte[]> DownloadAsync(string bucket, string name, long? offset = null, long? length = null)
+        {
+            var options = offset.HasValue && length.HasValue
+                ? new DownloadObjectOptions
+                {
+                    Range = new System.Net.Http.Headers.RangeHeaderValue(offset.Value, offset.Value + length.Value - 1),
+                    DownloadValidationMode = DownloadValidationMode.Never
+                }
+                : null;
+
             for (int attempt = 1; ; attempt++)
             {
                 using var timeout = new CancellationTokenSource(DownloadAttemptTimeout);
@@ -139,7 +236,7 @@ namespace HeroesProfile_GCP_ReplayParser
 
                 try
                 {
-                    await _storageClient.DownloadObjectAsync(bucket, name, stream, cancellationToken: timeout.Token);
+                    await _storageClient.DownloadObjectAsync(bucket, name, stream, options, timeout.Token);
                     return stream.ToArray();
                 }
                 catch (Exception ex) when (attempt < DownloadAttempts && IsTransient(ex))

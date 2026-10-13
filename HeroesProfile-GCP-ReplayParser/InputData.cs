@@ -28,6 +28,17 @@ namespace HeroesProfile_GCP_ReplayParser
 
         [JsonProperty("bucket")]
         public string Bucket { get; set; }
+
+        // parseType=deep only: the doc is cached under this ID.
+        [JsonProperty("replayID")]
+        public long? ReplayID { get; set; }
+
+        // parseType=deep only: a replay inside an archive bundle, read with a byte range.
+        [JsonProperty("offset")]
+        public long? Offset { get; set; }
+
+        [JsonProperty("length")]
+        public long? Length { get; set; }
     }
 
     public partial class InputData

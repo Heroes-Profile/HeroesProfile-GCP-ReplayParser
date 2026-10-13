@@ -1,0 +1,3 @@
+[submodule "HeroesProfile-GCP-ReplayParser/lib/Heroes.ReplayParser"]
+	path = HeroesProfile-GCP-ReplayParser/lib/Heroes.ReplayParser
+	url = https://github.com/Heroes-Profile/Heroes.ReplayParser

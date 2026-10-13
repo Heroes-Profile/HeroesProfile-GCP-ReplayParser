@@ -1,0 +1,72 @@
+# Build and deploy replay-parser-sentinel. Same steps the trigger ran inline, plus the
+# Heroes.ReplayParser submodule fetch: the buildpack builds HeroesProfile-GCP-ReplayParser/,
+# and the library lives at HeroesProfile-GCP-ReplayParser/lib/Heroes.ReplayParser.
+steps:
+  - id: Submodules
+    name: gcr.io/cloud-builders/git
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        # Trigger checkouts can arrive without .git, which submodule update needs.
+        if [ ! -d .git ]; then
+          git init -q
+          git remote add origin https://github.com/Heroes-Profile/HeroesProfile-GCP-ReplayParser.git
+          git fetch -q --depth 1 origin $COMMIT_SHA
+          git checkout -q -f FETCH_HEAD
+        fi
+        git submodule update --init --depth 1
+        test -f HeroesProfile-GCP-ReplayParser/lib/Heroes.ReplayParser/Heroes.ReplayParser/Heroes.ReplayParser.csproj
+
+  - id: Buildpack
+    name: gcr.io/k8s-skaffold/pack
+    entrypoint: pack
+    env:
+      - GOOGLE_FUNCTION_TARGET=$_FUNCTION_TARGET
+    args:
+      - build
+      - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - --builder=gcr.io/buildpacks/builder:latest
+      - --network=cloudbuild
+      - --publish
+      - --path=HeroesProfile-GCP-ReplayParser
+      - --env=GOOGLE_FUNCTION_TARGET
+
+  - id: Pull
+    name: gcr.io/cloud-builders/docker
+    args:
+      - pull
+      - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+
+  - id: Push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+
+  - id: Deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update
+      - $_SERVICE_NAME
+      - --platform=managed
+      - --image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - --labels=managed-by=gcp-cloud-build-deploy-cloud-run,commit-sha=$COMMIT_SHA,gcb-build-id=$BUILD_ID,gcb-trigger-id=$_TRIGGER_ID
+      - --region=$_DEPLOY_REGION
+      - --quiet
+
+images:
+  - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+
+tags:
+  - gcp-cloud-build-deploy-cloud-run
+  - gcp-cloud-build-deploy-cloud-run-managed
+  - replay-parser-sentinel
