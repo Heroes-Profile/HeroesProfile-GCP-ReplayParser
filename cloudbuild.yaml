@@ -24,6 +24,8 @@ steps:
     entrypoint: pack
     env:
       - GOOGLE_FUNCTION_TARGET=$_FUNCTION_TARGET
+      # The submodule brings its own .csproj files; the buildpack needs to be told which one to build.
+      - GOOGLE_BUILDABLE=HeroesProfile-GCP-ReplayParser.csproj
     args:
       - build
       - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
@@ -32,6 +34,7 @@ steps:
       - --publish
       - --path=HeroesProfile-GCP-ReplayParser
       - --env=GOOGLE_FUNCTION_TARGET
+      - --env=GOOGLE_BUILDABLE
 
   - id: Pull
     name: gcr.io/cloud-builders/docker
