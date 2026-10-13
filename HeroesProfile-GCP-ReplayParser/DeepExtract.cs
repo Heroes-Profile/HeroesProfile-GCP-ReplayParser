@@ -14,7 +14,7 @@ namespace HeroesProfile_GCP_ReplayParser
     // changes; cached docs with an older version are rebuilt from the archive.
     public static class DeepExtract
     {
-        public const int Version = 2;
+        public const int Version = 3;
 
         public static readonly string ParserVersion =
             typeof(Replay).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
@@ -50,6 +50,7 @@ namespace HeroesProfile_GCP_ReplayParser
             int[] Pt(Point point) => point == null ? null : new[] { point.X, point.Y };
 
             var gameEvents = replay.GameEvents.Where(g => g.player != null && index.ContainsKey(g.player)).ToList();
+            var heroUnits = new HashSet<Unit>(players.SelectMany(p => p.HeroUnits));
 
             return new
             {
@@ -147,12 +148,14 @@ namespace HeroesProfile_GCP_ReplayParser
                         .ToArray()
                 }),
 
+                // The parser's group list predates newer heroes (Xal'atath, Deathwing, Hogger...), so a hero
+                // is any unit in a player's HeroUnits, which go by name
                 units = replay.Units
-                    .Where(u => u.Group == Unit.UnitGroup.Hero || u.Group == Unit.UnitGroup.Structures || u.Group == Unit.UnitGroup.MapObjective || u.Group == Unit.UnitGroup.MercenaryCamp)
+                    .Where(u => heroUnits.Contains(u) || u.Group == Unit.UnitGroup.Structures || u.Group == Unit.UnitGroup.MapObjective || u.Group == Unit.UnitGroup.MercenaryCamp)
                     .Select(u => new
                     {
                         name = u.Name,
-                        g = u.Group.ToString(),
+                        g = heroUnits.Contains(u) ? Unit.UnitGroup.Hero.ToString() : u.Group.ToString(),
                         team = u.Team,
                         owner = P(u.PlayerControlledBy),
                         b = new[] { S(u.TimeSpanBorn), u.PointBorn?.X ?? -1, u.PointBorn?.Y ?? -1 },
