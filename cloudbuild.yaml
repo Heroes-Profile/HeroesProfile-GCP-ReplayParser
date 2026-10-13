@@ -64,6 +64,23 @@ steps:
       - --region=$_DEPLOY_REGION
       - --quiet
 
+  # The same image also serves deep analytics parses (parseType=deep) on its own service,
+  # so on-demand requests never compete with upload ingestion. Its scaling settings were
+  # set when it was created; deploying an image leaves them alone.
+  - id: DeployDeep
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - replay-parser-deep
+      - --platform=managed
+      - --image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - --base-image=us-east1-docker.pkg.dev/serverless-runtimes/google-24/runtimes/dotnet10
+      - --labels=managed-by=gcp-cloud-build-deploy-cloud-run,commit-sha=$COMMIT_SHA,gcb-build-id=$BUILD_ID,gcb-trigger-id=$_TRIGGER_ID
+      - --region=$_DEPLOY_REGION
+      - --quiet
+
 images:
   - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
 
